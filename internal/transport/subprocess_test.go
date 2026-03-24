@@ -82,6 +82,21 @@ func TestBuildArgsFullOptions(t *testing.T) {
 	assertContains(t, args, "--policy", "strict")
 }
 
+func TestBuildArgsWithPrefixArgs(t *testing.T) {
+	args := buildArgs("test", &Options{
+		CLIPrefixArgs: []string{"--yes", "@google/gemini-cli"},
+		Model:         "flash",
+	})
+	// Prefix args come first, then -p prompt, then flags.
+	if args[0] != "--yes" || args[1] != "@google/gemini-cli" {
+		t.Errorf("prefix args must come first: got %v", args[:4])
+	}
+	if args[2] != "-p" || args[3] != "test" {
+		t.Errorf("prompt must follow prefix: got args[2:4]=%v", args[2:4])
+	}
+	assertContains(t, args, "--model", "flash")
+}
+
 func TestSubprocessCloseWithoutStart(t *testing.T) {
 	s := &SubprocessTransport{}
 	if err := s.Close(); err != nil {

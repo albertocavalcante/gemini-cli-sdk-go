@@ -96,6 +96,7 @@ func toTransportOptions(opts *Options) (*transport.Options, func(), error) {
 		Policy:                opts.Policy,
 		WorkingDirectory:      opts.WorkingDirectory,
 		CLIPath:               opts.CLIPath,
+		CLIPrefixArgs:         opts.CLIPrefixArgs,
 		Env:                   opts.Env,
 	}
 

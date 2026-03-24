@@ -18,6 +18,7 @@ type Options struct {
 	Policy                []string
 	WorkingDirectory      string
 	CLIPath               string
+	CLIPrefixArgs         []string // args inserted between CLIPath and gemini-cli flags (e.g., ["--yes", "@google/gemini-cli"] for npx)
 	Env                   map[string]string
 	SettingsPath          string
 }

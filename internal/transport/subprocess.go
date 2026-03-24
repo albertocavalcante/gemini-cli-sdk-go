@@ -101,8 +101,14 @@ func (s *SubprocessTransport) Close() error {
 }
 
 // buildArgs constructs the CLI argument list from options.
+// When CLIPrefixArgs is set (e.g., for npx), they are prepended before the
+// gemini-cli flags: npx --yes @google/gemini-cli -p prompt --output-format stream-json
 func buildArgs(prompt string, opts *Options) []string {
-	args := []string{"-p", prompt, "--output-format", "stream-json"}
+	var prefix []string
+	if opts != nil {
+		prefix = opts.CLIPrefixArgs
+	}
+	args := append(prefix, "-p", prompt, "--output-format", "stream-json")
 	if opts == nil {
 		return args
 	}

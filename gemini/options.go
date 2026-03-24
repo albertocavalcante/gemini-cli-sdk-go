@@ -18,7 +18,13 @@ type Options struct {
 
 	// CLIPath overrides the path to the gemini binary.
 	// Defaults to "gemini" resolved from PATH.
+	// When using a package runner (npx, bunx), set CLIPath to "npx"
+	// and CLIPrefixArgs to ["--yes", "@google/gemini-cli"].
 	CLIPath string
+
+	// CLIPrefixArgs are inserted between CLIPath and the gemini-cli flags.
+	// Used when invoking via npx/bunx/pnpm dlx.
+	CLIPrefixArgs []string
 
 	// Env provides additional environment variables for the CLI subprocess.
 	// Use "GEMINI_API_KEY" for API key authentication.
