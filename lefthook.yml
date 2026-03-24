@@ -1,0 +1,25 @@
+pre-commit:
+  parallel: true
+  commands:
+    go-fmt:
+      glob: "*.go"
+      run: test -z "$(gofmt -l . | grep -v vendor)" || (gofmt -d . && exit 1)
+    go-lint:
+      glob: "*.go"
+      run: go vet ./...
+
+commit-msg:
+  commands:
+    conventional-commit:
+      run: |
+        msg=$(cat {1})
+        pattern="^(feat|fix|docs|chore|refactor|test|ci|perf|style|build)(\(.+\))?: .+"
+        if ! echo "$msg" | grep -qE "$pattern"; then
+          echo "Commit message must follow conventional commits: type(scope): description"
+          exit 1
+        fi
+
+output:
+  - meta
+  - summary
+  - success
