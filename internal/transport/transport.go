@@ -46,15 +46,34 @@ type Transport interface {
 type MockTransport struct {
 	RawLines []json.RawMessage
 	StartErr error
-	ch       chan RawLineOrError
+
+	// SlowMode, when true, makes Start succeed but defers sending lines
+	// until Close is called. This simulates a long-running query.
+	SlowMode bool
+
+	ch      chan RawLineOrError
+	closeCh chan struct{}
 }
 
 // Start replays the canned lines.
-func (m *MockTransport) Start(_ context.Context, _ string, _ *Options) error {
+func (m *MockTransport) Start(ctx context.Context, _ string, _ *Options) error {
 	if m.StartErr != nil {
 		return m.StartErr
 	}
 	m.ch = make(chan RawLineOrError, len(m.RawLines)+1)
+
+	if m.SlowMode {
+		m.closeCh = make(chan struct{})
+		go func() {
+			defer close(m.ch)
+			select {
+			case <-m.closeCh:
+			case <-ctx.Done():
+			}
+		}()
+		return nil
+	}
+
 	for _, line := range m.RawLines {
 		cp := make([]byte, len(line))
 		copy(cp, line)
@@ -69,5 +88,14 @@ func (m *MockTransport) Lines() <-chan RawLineOrError {
 	return m.ch
 }
 
-// Close is a no-op for the mock.
-func (m *MockTransport) Close() error { return nil }
+// Close signals slow mode to stop.
+func (m *MockTransport) Close() error {
+	if m.closeCh != nil {
+		select {
+		case <-m.closeCh:
+		default:
+			close(m.closeCh)
+		}
+	}
+	return nil
+}

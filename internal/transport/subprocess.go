@@ -32,7 +32,13 @@ func (s *SubprocessTransport) Start(ctx context.Context, prompt string, opts *Op
 		cliPath = opts.CLIPath
 	}
 
-	s.cmd = exec.CommandContext(ctx, cliPath, buildArgs(prompt, opts)...)
+	// Cache the resolved binary path to avoid repeated PATH lookups.
+	resolved, err := LookPath(cliPath)
+	if err != nil {
+		return fmt.Errorf("cannot find %s: %w", cliPath, err)
+	}
+
+	s.cmd = exec.CommandContext(ctx, resolved, buildArgs(prompt, opts)...)
 
 	if opts != nil && opts.WorkingDirectory != "" {
 		s.cmd.Dir = opts.WorkingDirectory

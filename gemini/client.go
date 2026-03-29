@@ -10,13 +10,22 @@ import (
 
 // GeminiClient manages a persistent Gemini CLI session.
 // Session state is preserved across [GeminiClient.Query] calls via --resume.
+//
+// When a new Query arrives while one is already in-flight, the client
+// cancels the in-flight query and starts the new one immediately
+// (cancel-and-replace). This prevents "session already in use" errors
+// and provides snappy UX when users send messages rapidly.
 type GeminiClient struct {
 	opts      Options
 	sessionID string
-	mu        sync.Mutex
+	mu        sync.RWMutex
 	// transport is nil for production (creates SubprocessTransport per query).
 	// Set via newClientWithTransport for testing.
 	transport transport.Transport
+
+	// Active query tracking for cancel-and-replace.
+	activeCancel context.CancelFunc
+	activeDone   chan struct{}
 }
 
 // NewClient creates a new GeminiClient with the given options.
@@ -26,56 +35,107 @@ func NewClient(opts Options) *GeminiClient {
 
 // SessionID returns the current session ID (thread-safe).
 func (c *GeminiClient) SessionID() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.sessionID
+}
+
+// Close cancels any in-flight query and releases resources.
+func (c *GeminiClient) Close() error {
+	c.mu.Lock()
+	cancel := c.activeCancel
+	done := c.activeDone
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+	return nil
 }
 
 // Query sends a prompt and returns a channel of messages.
 // Subsequent calls use --resume with the captured session ID.
+//
+// If a previous query is still in-flight, it is cancelled before the new
+// one starts. This ensures only one subprocess uses the session at a time.
 func (c *GeminiClient) Query(ctx context.Context, prompt string) <-chan MessageOrError {
-	c.mu.Lock()
-	opts := c.opts
-	if c.sessionID != "" {
-		opts.SessionID = c.sessionID
-	}
-	c.mu.Unlock()
-
-	tOpts, cleanup, err := toTransportOptions(&opts)
-	if err != nil {
-		ch := make(chan MessageOrError, 1)
-		go func() {
-			ch <- MessageOrError{Err: fmt.Errorf("configuring transport: %w", err)}
-			close(ch)
-		}()
-		return ch
-	}
-
-	tr := c.newTransport()
 	ch := make(chan MessageOrError, 10)
-	hr := newHookRunner(opts.Hooks, c.SessionID())
 
 	go func() {
 		defer close(ch)
+
+		// Cancel any in-flight query and wait for it to finish.
+		c.mu.Lock()
+		prevCancel := c.activeCancel
+		prevDone := c.activeDone
+		c.mu.Unlock()
+
+		if prevCancel != nil {
+			prevCancel()
+		}
+		if prevDone != nil {
+			<-prevDone
+		}
+
+		// Create a cancellable context for this query.
+		queryCtx, queryCancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+
+		// Register as the active query and snapshot session state.
+		c.mu.Lock()
+		c.activeCancel = queryCancel
+		c.activeDone = done
+		opts := c.opts
+		if c.sessionID != "" {
+			opts.SessionID = c.sessionID
+		}
+		c.mu.Unlock()
+
+		// Signal completion when this goroutine exits.
+		defer func() {
+			queryCancel()
+			close(done)
+		}()
+
+		tOpts, cleanup, err := toTransportOptions(&opts)
+		if err != nil {
+			ch <- MessageOrError{Err: fmt.Errorf("configuring transport: %w", err)}
+			return
+		}
 		defer cleanup()
+
+		tr := c.newTransport()
 		defer func() { _ = tr.Close() }()
 
-		if err := tr.Start(ctx, prompt, tOpts); err != nil {
+		if err := tr.Start(queryCtx, prompt, tOpts); err != nil {
 			ch <- MessageOrError{Err: err}
 			return
 		}
 
+		hr := newHookRunner(opts.Hooks, c.SessionID())
+
 		for raw := range tr.Lines() {
-			if ctx.Err() != nil {
+			if queryCtx.Err() != nil {
 				return
 			}
 			if raw.Err != nil {
-				ch <- MessageOrError{Err: raw.Err}
+				select {
+				case ch <- MessageOrError{Err: raw.Err}:
+				case <-queryCtx.Done():
+					return
+				}
 				continue
 			}
 			msg, err := ParseMessage(raw.Line)
 			if err != nil {
-				ch <- MessageOrError{Err: err}
+				select {
+				case ch <- MessageOrError{Err: err}:
+				case <-queryCtx.Done():
+					return
+				}
 				continue
 			}
 
@@ -87,8 +147,13 @@ func (c *GeminiClient) Query(ctx context.Context, prompt string) <-chan MessageO
 				hr.sessionID = im.SessionID
 			}
 
-			hr.fireHooks(ctx, msg)
-			ch <- MessageOrError{Message: msg}
+			hr.fireHooks(queryCtx, msg)
+
+			select {
+			case ch <- MessageOrError{Message: msg}:
+			case <-queryCtx.Done():
+				return
+			}
 		}
 	}()
 
@@ -97,6 +162,8 @@ func (c *GeminiClient) Query(ctx context.Context, prompt string) <-chan MessageO
 
 // newTransport returns the transport to use for a query.
 func (c *GeminiClient) newTransport() transport.Transport {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.transport != nil {
 		return c.transport
 	}
