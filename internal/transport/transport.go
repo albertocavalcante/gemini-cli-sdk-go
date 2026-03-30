@@ -4,6 +4,7 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"sync"
 )
 
 // Options holds the configuration passed from the public API to the transport layer.
@@ -51,8 +52,9 @@ type MockTransport struct {
 	// until Close is called. This simulates a long-running query.
 	SlowMode bool
 
-	ch      chan RawLineOrError
-	closeCh chan struct{}
+	ch        chan RawLineOrError
+	closeCh   chan struct{}
+	closeOnce sync.Once
 }
 
 // Start replays the canned lines.
@@ -90,12 +92,10 @@ func (m *MockTransport) Lines() <-chan RawLineOrError {
 
 // Close signals slow mode to stop.
 func (m *MockTransport) Close() error {
-	if m.closeCh != nil {
-		select {
-		case <-m.closeCh:
-		default:
+	m.closeOnce.Do(func() {
+		if m.closeCh != nil {
 			close(m.closeCh)
 		}
-	}
+	})
 	return nil
 }

@@ -18,7 +18,7 @@ import (
 type GeminiClient struct {
 	opts      Options
 	sessionID string
-	mu        sync.RWMutex
+	mu        sync.RWMutex // protects sessionID, activeCancel, activeDone, transport
 	// transport is nil for production (creates SubprocessTransport per query).
 	// Set via newClientWithTransport for testing.
 	transport transport.Transport
