@@ -17,6 +17,6 @@ fmt:
     gofmt -w .
 
 fmt-check:
-    @test -z "$$(gofmt -l .)" || (gofmt -d . && exit 1)
+    @test -z "$(gofmt -l .)" || (gofmt -d . && exit 1)
 
 check: fmt-check lint test build

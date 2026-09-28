@@ -42,11 +42,19 @@ func Query(ctx context.Context, prompt string, opts Options) <-chan MessageOrErr
 // transport (used for testing with MockTransport).
 func queryWithTransport(ctx context.Context, prompt string, opts Options, t transport.Transport) <-chan MessageOrError {
 	ch := make(chan MessageOrError, 10)
+	send := func(item MessageOrError) bool {
+		select {
+		case ch <- item:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 
 	tOpts, cleanup, err := toTransportOptions(&opts)
 	if err != nil {
 		go func() {
-			ch <- MessageOrError{Err: fmt.Errorf("configuring transport: %w", err)}
+			send(MessageOrError{Err: fmt.Errorf("configuring transport: %w", err)})
 			close(ch)
 		}()
 		return ch
@@ -58,24 +66,41 @@ func queryWithTransport(ctx context.Context, prompt string, opts Options, t tran
 		defer func() { _ = t.Close() }()
 
 		if err := t.Start(ctx, prompt, tOpts); err != nil {
-			ch <- MessageOrError{Err: err}
+			send(MessageOrError{Err: err})
 			return
 		}
 
-		for raw := range t.Lines() {
+		lines := t.Lines()
+		for {
+			var raw transport.RawLineOrError
+			select {
+			case item, ok := <-lines:
+				if !ok {
+					return
+				}
+				raw = item
+			case <-ctx.Done():
+				return
+			}
 			if ctx.Err() != nil {
 				return
 			}
 			if raw.Err != nil {
-				ch <- MessageOrError{Err: raw.Err}
+				if !send(MessageOrError{Err: raw.Err}) {
+					return
+				}
 				continue
 			}
 			msg, err := ParseMessage(raw.Line)
 			if err != nil {
-				ch <- MessageOrError{Err: err}
+				if !send(MessageOrError{Err: err}) {
+					return
+				}
 				continue
 			}
-			ch <- MessageOrError{Message: msg}
+			if !send(MessageOrError{Message: msg}) {
+				return
+			}
 		}
 	}()
 

@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -19,73 +22,104 @@ const (
 // SubprocessTransport spawns the gemini CLI as a subprocess and
 // reads streaming JSON from its stdout.
 type SubprocessTransport struct {
-	cmd    *exec.Cmd
-	ch     chan RawLineOrError
-	done   chan struct{}
-	stderr *strings.Builder
+	cmd       *exec.Cmd
+	ch        chan RawLineOrError
+	done      chan struct{}
+	stop      chan struct{}
+	stdout    io.ReadCloser
+	stderr    *strings.Builder
+	closeOnce sync.Once
+	mu        sync.Mutex
 }
 
 // Start launches the gemini CLI with the given prompt and options.
 func (s *SubprocessTransport) Start(ctx context.Context, prompt string, opts *Options) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done != nil {
+		return fmt.Errorf("transport already started")
+	}
 	cliPath := defaultCLI
 	if opts != nil && opts.CLIPath != "" {
 		cliPath = opts.CLIPath
 	}
-
-	// Cache the resolved binary path to avoid repeated PATH lookups.
 	resolved, err := LookPath(cliPath)
 	if err != nil {
 		return fmt.Errorf("cannot find %s: %w", cliPath, err)
 	}
-
-	s.cmd = exec.CommandContext(ctx, resolved, buildArgs(prompt, opts)...)
-
+	cmd := exec.CommandContext(ctx, resolved, buildArgs(prompt, opts)...)
+	s.cmd = cmd
 	if opts != nil && opts.WorkingDirectory != "" {
-		s.cmd.Dir = opts.WorkingDirectory
+		cmd.Dir = opts.WorkingDirectory
 	}
-
-	// Build environment: inherit current + custom vars + settings path.
-	s.cmd.Env = buildEnv(opts)
-
-	stdout, err := s.cmd.StdoutPipe()
+	cmd.Env = buildEnv(opts)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-
+	s.stdout = stdout
 	s.stderr = &strings.Builder{}
-	s.cmd.Stderr = s.stderr
-
-	if err := s.cmd.Start(); err != nil {
+	cmd.Stderr = s.stderr
+	// Cancellation must also unblock a scanner when descendants inherit stdout.
+	cmd.Cancel = func() error {
+		err := cmd.Process.Kill()
+		_ = stdout.Close()
+		return err
+	}
+	// Bound stderr copier cleanup when descendants inherit that descriptor.
+	cmd.WaitDelay = time.Second
+	if err := cmd.Start(); err != nil {
+		_ = stdout.Close()
 		return fmt.Errorf("starting %s: %w", cliPath, err)
 	}
-
 	s.ch = make(chan RawLineOrError, chanBufSize)
 	s.done = make(chan struct{})
-
+	s.stop = make(chan struct{})
 	go func() {
 		defer close(s.done)
 		defer close(s.ch)
-
+		send := func(raw RawLineOrError) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-s.stop:
+				return false
+			default:
+			}
+			select {
+			case s.ch <- raw:
+				return true
+			case <-ctx.Done():
+				return false
+			case <-s.stop:
+				return false
+			}
+		}
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
-
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if len(line) == 0 {
 				continue
 			}
-			s.ch <- RawLineOrError{Line: bytes.Clone(line)}
+			if !send(RawLineOrError{Line: bytes.Clone(line)}) {
+				break
+			}
 		}
-
-		if err := scanner.Err(); err != nil {
-			s.ch <- RawLineOrError{Err: fmt.Errorf("scanner: %w", err)}
+		scanErr := scanner.Err()
+		_ = stdout.Close()
+		if scanErr != nil {
+			_ = cmd.Process.Kill()
 		}
-
-		if err := s.cmd.Wait(); err != nil {
-			s.ch <- RawLineOrError{Err: fmt.Errorf("process exited: %w (stderr: %s)", err, strings.TrimSpace(s.stderr.String()))}
+		// Wait always reaps the process before attempting terminal error delivery.
+		waitErr := cmd.Wait()
+		if scanErr != nil {
+			send(RawLineOrError{Err: fmt.Errorf("scanner: %w", scanErr)})
+		}
+		if waitErr != nil {
+			send(RawLineOrError{Err: fmt.Errorf("process exited: %w (stderr: %s)", waitErr, strings.TrimSpace(s.stderr.String()))})
 		}
 	}()
-
 	return nil
 }
 
@@ -94,15 +128,18 @@ func (s *SubprocessTransport) Lines() <-chan RawLineOrError {
 	return s.ch
 }
 
-// Close terminates the subprocess if still running.
+// Close terminates the subprocess and unblocks a reader whose output
+// channel is full, even when the parent context remains active.
 func (s *SubprocessTransport) Close() error {
-	if s.cmd == nil || s.cmd.Process == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done == nil {
 		return nil
 	}
+	s.closeOnce.Do(func() { close(s.stop) })
 	_ = s.cmd.Process.Kill()
-	if s.done != nil {
-		<-s.done
-	}
+	_ = s.stdout.Close()
+	<-s.done
 	return nil
 }
 
